@@ -1,0 +1,40 @@
+# ---- Python ----
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- pip 缓存与临时目录（沙箱环境下会重定向到工作区，绝不可提交）----
+.pipcache/
+.tmp/
+pip-*.log
+
+# ---- CUDA 运行库 wheel 缓存（cublas 553MB + cudnn 743MB，绝不可提交）----
+.tmp/whl/
+*.whl
+*.zip
+
+# ---- Whisper 模型缓存（large-v3 约 3GB，绝不提交）----
+.hf/
+.cache/
+models/
+
+# ---- 随程序分发的第三方工具（seconv.exe 约 81MB，按需下载）----
+tools/
+
+# ---- 运行产物与日志 ----
+logs/
+test_output/
+*.log
+
+# ---- 测试素材（体积大，测试时本地放入即可）----
+test.mp4
+*.mp4
+*.wav
+*.mkv
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
