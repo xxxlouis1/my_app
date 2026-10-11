@@ -11,6 +11,20 @@
 
 ---
 
+## 仓库与克隆
+
+```bat
+:: 推荐（443 端口，能穿透多数对 GitHub 的限制）
+git clone ssh://git@ssh.github.com:443/xxxlouis1/my_app.git
+
+:: 常规 SSH（若你的网络可访问 github.com:22）
+git clone git@github.com:xxxlouis1/my_app.git
+```
+
+克隆后按下方「快速开始」两步即可运行。
+
+---
+
 ## 快速开始
 
 ### 1. 一键安装环境
