@@ -15,6 +15,9 @@
 #   set TEMP=%CD%\.tmp
 # ============================================================
 
+# ---- GUI（第一板块）----
+PySide6==6.7.3              # Qt6 界面框架（controller/qt_worker.py 首选 PySide6）
+
 # ---- ASR 核心（第四板块）----
 faster-whisper==1.2.1
 ctranslate2==4.8.2          # faster-whisper 的推理后端
