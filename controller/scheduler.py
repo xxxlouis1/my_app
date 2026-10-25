@@ -119,6 +119,14 @@ class BatchConfig:
     device: str = "auto"
     compute_type: str = ""             # 留空则按 device 自动选择
 
+    # Whisper 解码参数（GUI 参数面板 -> 透传给 AsrEngine.decode_options）
+    temperature: str = ""              # 逗号分隔，如 "0.0, 0.2, 0.4"；空串用后端默认
+    beam_size: int = 5
+    vad_filter: bool = True
+    # 可选参考 SRT：非空时走"已有字幕校正"流程（由第二/第四板块消费，
+    # 第一板块只负责把 GUI 选中的 SRT 路径写进来）
+    input_srt: str = ""
+
     # 校正参数（透传给第四板块）
     max_line_chars: int = 43
     max_lines: int = 2
@@ -391,6 +399,30 @@ class BatchScheduler:
             ct = "int8_float16" if dev == "cuda" else "int8"
         return dev, ct
 
+    def _build_decode_options(self):
+        """把 GUI 传来的 Whisper 解码参数整理成 AsrEngine 的 decode_options。
+
+        温度默认为浮点列表（faster-whisper 的 fallback 温度序列）；GUI 传入
+        逗号分隔字符串，这里解析成浮点列表。未设置时返回 None（用后端默认）。
+        """
+        opts: Dict[str, Any] = {}
+        if self.config.temperature:
+            temps: List[float] = []
+            for s in str(self.config.temperature).split(","):
+                s = s.strip()
+                if not s:
+                    continue
+                try:
+                    temps.append(float(s))
+                except ValueError:
+                    continue
+            if temps:
+                opts["temperature"] = temps
+        if self.config.beam_size > 0:
+            opts["beam_size"] = int(self.config.beam_size)
+        opts["vad_filter"] = bool(self.config.vad_filter)
+        return opts or None
+
     def _get_engine(self):
         """懒加载并**全局复用**一个 ASR 引擎。
 
@@ -410,6 +442,7 @@ class BatchScheduler:
                     device=dev,
                     compute_type=ct,
                     language=self.config.language,
+                    decode_options=self._build_decode_options(),
                 )
                 self._engine.load()
                 self._emit_log("INFO", "模型加载完成，后续任务复用该实例")
