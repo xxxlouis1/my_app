@@ -81,6 +81,16 @@ class SrtPreviewWidget(QWidget):
         self.info_label.setText("未加载字幕")
         self.page_label.setText("第 0/0 页")
 
+    def cues(self):
+        """返回当前字幕列表（可能已被波形断点拖拽修改过时间）。"""
+        return list(self._cues)
+
+    def set_cues(self, cues):
+        """用外部（如波形编辑）修改后的字幕刷新表格。"""
+        self._cues = list(cues)
+        self._page = min(self._page, max(0, self._page_count - 1))
+        self._refresh()
+
     # ------------------------------------------------------------ 分页
     @property
     def _page_count(self) -> int:

@@ -30,6 +30,16 @@ def _ts_to_ms(h: str, m: str, s: str, ms: str) -> int:
     return (int(h) * 3600 + int(m) * 60 + int(s)) * 1000 + int(ms.ljust(3, "0")[:3])
 
 
+def ms_to_ts(ms: int) -> str:
+    """毫秒 → "HH:MM:SS,mmm"（波形断点拖拽后回写展示用）。"""
+    ms = max(0, int(ms))
+    h = ms // 3600000
+    m = (ms // 60000) % 60
+    s = (ms // 1000) % 60
+    r = ms % 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{r:03d}"
+
+
 def read_srt_file(path: str) -> Tuple[Optional[str], Optional[str]]:
     """读取 SRT 文件，自动探测编码。返回 (文本, 错误)；出错时文本为 None。"""
     for enc in ("utf-8-sig", "utf-8", "gbk", "utf-16"):
