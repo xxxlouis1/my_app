@@ -1,0 +1,47 @@
+1
+00:00:00,300 --> 00:00:04,200
+I didn't feel like eating because I felt sick.
+
+2
+00:00:04,500 --> 00:00:08,400
+It was a cloudy day in Moscow.
+
+3
+00:00:08,700 --> 00:00:12,600
+We visited Red Square in the morning.
+
+4
+00:00:12,900 --> 00:00:16,800
+The fountain looked beautiful in the sun.
+
+5
+00:00:17,100 --> 00:00:21,000
+I bought a postcard for my sister.
+
+6
+00:00:21,300 --> 00:00:25,200
+Lunch was at a small café near the river.
+
+7
+00:00:25,500 --> 00:00:29,400
+The soup was too salty for me.
+
+8
+00:00:29,700 --> 00:00:33,600
+We walked along the street after lunch.
+
+9
+00:00:33,900 --> 00:00:37,800
+I took many photos of the church.
+
+10
+00:00:38,100 --> 00:00:42,000
+In the evening we watched a show.
+
+11
+00:00:42,300 --> 00:00:46,200
+I felt much better by the end of the day.
+
+12
+00:00:46,500 --> 00:00:50,400
+We planned to visit the museum tomorrow.
