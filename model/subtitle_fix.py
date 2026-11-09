@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import bisect
 import logging
+import math
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -66,6 +67,9 @@ class FixConfig:
     # 因此默认不填充，短段由 advisories() 作为提示给出。
     min_duration_ms: int = 0
     max_duration_ms: int = 10000
+    # 短于此值的段视为"碎片"，并入相邻段（实测出现过 24ms 的碎片，
+    # 在 Aboboo 里根本来不及看清）
+    tiny_duration_ms: int = 150
     min_gap_ms: int = 24              # seconv 默认 minimumMillisecondsBetweenLines
     suggested_gap_ms: int = 150       # 更安全的段间隙
 
@@ -103,6 +107,11 @@ class Cue:
     text: str
     words: List[Word] = field(default_factory=list)
     origin: str = "asr"               # asr | split | snap
+    # 质量指标（从 ASR 的 Segment 透传，供错误检测使用；外部传入的 SRT 为 None）
+    avg_logprob: Optional[float] = None
+    no_speech_prob: Optional[float] = None
+    compression_ratio: Optional[float] = None
+    temperature: Optional[float] = None
 
     @property
     def start_ms(self) -> int:
@@ -115,6 +124,23 @@ class Cue:
     @property
     def duration_ms(self) -> int:
         return self.end_ms - self.start_ms
+
+    def quality(self, cfg: Optional["QualityThresholds"] = None) -> str:
+        """质量等级 ok / suspect / bad（委托给 asr.Segment 的判定逻辑）。"""
+        from .asr import Segment as _Seg
+        return _Seg(start=self.start, end=self.end, text=self.text,
+                    avg_logprob=self.avg_logprob,
+                    no_speech_prob=self.no_speech_prob,
+                    compression_ratio=self.compression_ratio,
+                    temperature=self.temperature).quality(cfg)
+
+    def with_times(self, start: float, end: float) -> "Cue":
+        """返回只改了时间、其余字段不变的副本（保持质量指标不丢失）。"""
+        return Cue(start=start, end=end, text=self.text, words=self.words,
+                   origin=self.origin, avg_logprob=self.avg_logprob,
+                   no_speech_prob=self.no_speech_prob,
+                   compression_ratio=self.compression_ratio,
+                   temperature=self.temperature)
 
 
 @dataclass
@@ -131,17 +157,26 @@ class FixReport:
     duration_fixed: int = 0
     gap_fixed: int = 0
     wrapped: int = 0
+    # ---- 本轮新增：覆盖"修掉所有可修错误"的各类修复计数 ----
+    oversize_split: int = 0   # 超长段被切分（而非截断）
+    extended: int = 0         # 过短段被延长到语音区间结束
+    clamped: int = 0          # 负值/超出音频时长被钳制
+    truncated: int = 0        # 仍被截断的（应尽量为 0，仅兜底）
     snap_shift_ms: List[int] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         parts = [f"剔除 {self.dropped}", f"切分 {self.split}",
+                 f"超长切分 {self.oversize_split}",
                  f"合并 {self.merged}",
                  f"重复保留 {self.duplicates}",
                  f"吸附起/止 {self.snapped_start}/{self.snapped_end}",
                  f"放弃吸附 {self.snap_giveup}",
+                 f"延长 {self.extended}", f"钳制 {self.clamped}",
                  f"时长修正 {self.duration_fixed}", f"间隙修正 {self.gap_fixed}",
                  f"换行 {self.wrapped}"]
+        if self.truncated:
+            parts.append(f"仍被截断 {self.truncated}")
         if self.snap_shift_ms:
             s = sorted(self.snap_shift_ms)
             parts.append(f"吸附位移中位 {s[len(s)//2]}ms")
@@ -213,7 +248,12 @@ def drop_invalid(segments: Sequence[Segment], cfg: FixConfig,
         prev_text = text.lower()
 
         cues.append(Cue(start=seg.start, end=seg.end, text=text,
-                        words=list(seg.words)))
+                        words=list(seg.words),
+                        # 透传质量指标，供错误检测使用
+                        avg_logprob=getattr(seg, "avg_logprob", None),
+                        no_speech_prob=getattr(seg, "no_speech_prob", None),
+                        compression_ratio=getattr(seg, "compression_ratio", None),
+                        temperature=getattr(seg, "temperature", None)))
     if report.duplicates:
         report.issues.append(
             f"检测到 {report.duplicates} 处相邻重复文本，可能是跟读素材的刻意重复，"
@@ -550,8 +590,12 @@ def enforce_constraints(cues: Sequence[Cue], cfg: FixConfig,
 
         for c in items:                     # 只修过长；过短交给自检提示
             if c.end - c.start > max_dur:
+                # 正常情况下 split_oversized 已在前面切好了，走到这里说明
+                # 切分失败（比如没有语音区间可参考），只能截断兜底。
+                # 单独计数，便于发现"仍在截断"这种不理想情况。
                 c.end = c.start + max_dur
                 report.duration_fixed += 1
+                report.truncated += 1
                 changed = True
         if not changed:
             break
@@ -713,6 +757,234 @@ def verify_against_baseline(cues: Sequence[Cue],
     return problems
 
 
+# ---------------------------------------------------------------- 全量修复
+# 下列函数对应本周需求一："自动修改时能够修改所有错误"。
+# 它们只处理**可判定且可安全修复**的错误；识别类错误（文本错字）不在其中 ——
+# 那需要人工校对或换更大模型重跑，见 model/error_detect.py 的说明。
+
+
+def _region_containing(start: float, anchors: Sequence[Tuple[float, float]],
+                       tol: float = 0.05) -> Optional[Tuple[float, float]]:
+    """找起点所属的语音区间（与吸附阶段同一套锚点）。"""
+    for a, b in anchors:
+        if a - tol <= start <= b + tol:
+            return (a, b)
+    return None
+
+
+def _with_meta(src: Cue, start: float, end: float, text: Optional[str] = None,
+               words: Optional[List[Word]] = None,
+               origin: Optional[str] = None) -> Cue:
+    """基于 src 造一条新 Cue，完整保留质量指标（否则错误检测会失去依据）。"""
+    return Cue(start=start, end=end,
+               text=src.text if text is None else text,
+               words=src.words if words is None else words,
+               origin=src.origin if origin is None else origin,
+               avg_logprob=src.avg_logprob,
+               no_speech_prob=src.no_speech_prob,
+               compression_ratio=src.compression_ratio,
+               temperature=src.temperature)
+
+
+def clamp_to_media(cues: Sequence[Cue], duration: Optional[float],
+                   cfg: FixConfig, report: FixReport) -> List[Cue]:
+    """修 1：把负值/超出音频时长的边界钳制回合法范围。
+
+    之前完全没有这一步 —— 一旦出现负值或超出结尾，SRT 直接带着非法
+    时间戳交付，Aboboo 可能拒载或产生错误断点。
+    """
+    if not duration or duration <= 0:
+        return list(cues)
+    out: List[Cue] = []
+    for c in cues:
+        start = max(0.0, c.start)
+        end = min(c.end, duration)
+        if end <= start:
+            # 整条落在音频之外 -> 无意义，剔除
+            report.dropped += 1
+            continue
+        if abs(start - c.start) > 1e-9 or abs(end - c.end) > 1e-9:
+            out.append(_with_meta(c, start, end))
+            report.clamped += 1
+        else:
+            out.append(c)
+    return out
+
+
+def extend_short(cues: Sequence[Cue], boundaries: SpeechBoundaries,
+                 cfg: FixConfig, report: FixReport) -> List[Cue]:
+    """修 2：过短的字幕，在语音区间内延长。
+
+    只延长到"所属语音区间的结束"，不会越界到别的句子；且不会顶到
+    下一条字幕（留出最小间隙）。语音区间本身就很短时不处理。
+    """
+    if not cfg.min_duration_ms or not boundaries or not boundaries.speech:
+        return list(cues)
+    anchors = filter_speech(boundaries.speech, cfg.min_anchor_speech) \
+        or filter_speech(boundaries.speech, cfg.min_speech)
+    if not anchors:
+        return list(cues)
+
+    min_dur = cfg.min_duration_ms / 1000.0
+    min_gap = cfg.min_gap_ms / 1000.0
+    out = list(cues)
+    for i, c in enumerate(out):
+        if c.end - c.start >= min_dur:
+            continue
+        reg = _region_containing(c.start, anchors)
+        if reg is None:
+            continue
+        limit = reg[1]
+        if i + 1 < len(out):
+            limit = min(limit, out[i + 1].start - min_gap)
+        new_end = min(limit, c.start + max(min_dur, limit - c.start))
+        if new_end > c.end + 1e-6:
+            out[i] = _with_meta(c, c.start, new_end, origin=c.origin)
+            report.extended += 1
+    return out
+
+
+def split_oversized(cues: Sequence[Cue], boundaries: SpeechBoundaries,
+                    cfg: FixConfig, report: FixReport) -> List[Cue]:
+    """修 3：超长字幕**切分**而不是截断。
+
+    这是本轮最重要的修正。此前 ``enforce_constraints`` 直接把超过
+    max_duration 的段截到上限，结果**文本还在、覆盖时长少了一半** ——
+    表现为"语音还在说，字幕已经消失了"（用户实测反馈过）。
+
+    现在改为切分，优先级：
+      1. 有词级时间戳 -> 按词边界切（精确）
+      2. 无词级但有多个语音区间 -> 按区间分派文本（近似）
+      3. 都没有 -> 按时间等分（最后手段，仅保证覆盖不丢）
+    """
+    max_dur = cfg.max_duration_ms / 1000.0
+    if not max_dur or max_dur <= 0:
+        return list(cues)
+    anchors = []
+    if boundaries and boundaries.speech:
+        anchors = filter_speech(boundaries.speech, cfg.min_speech)
+
+    out: List[Cue] = []
+    for cue in cues:
+        dur = cue.end - cue.start
+        if dur <= max_dur or not cue.text.strip():
+            out.append(cue)
+            continue
+
+        regions = [(a, b) for a, b in anchors
+                   if b > cue.start and a < cue.end]
+
+        # --- 路线 1/2：有语音区间可用
+        if len(regions) >= 2:
+            groups: Optional[List[List[Word]]] = None
+            if cue.words:
+                groups = _assign_words_to_regions(cue.words, regions)
+                if len(groups) < len(regions):
+                    by_gap = _group_contiguous(cue.words, cfg.split_gap)
+                    if len(by_gap) > len(groups):
+                        groups = by_gap
+                if groups and len(groups) > 1:
+                    for ws in groups:
+                        text = "".join(w.text for w in ws).strip()
+                        if not text:
+                            continue
+                        out.append(_with_meta(
+                            cue, ws[0].start, ws[-1].end, text=text,
+                            words=list(ws), origin="split"))
+                    report.oversize_split += len(groups) - 1
+                    continue
+            pieces = _split_text_proportional(cue.text, regions)
+            if len(pieces) > 1:
+                for reg, text in pieces:
+                    if not text.strip():
+                        continue
+                    out.append(_with_meta(cue, reg[0], reg[1],
+                                          text=text.strip(), origin="split"))
+                report.oversize_split += len(pieces) - 1
+                continue
+
+        # --- 路线 3：按时间等分（兜底，保证不丢覆盖）
+        n = int(math.ceil(dur / max_dur))
+        n = max(2, min(n, 8))          # 最多 8 段，避免碎片化
+        words = cue.text.split()
+        if not words:
+            out.append(cue)
+            continue
+        per = max(1, int(math.ceil(len(words) / n)))
+        chunk_idx = 0
+        seg_dur = dur / n
+        for k in range(n):
+            a = cue.start + k * seg_dur
+            b = cue.end if k == n - 1 else cue.start + (k + 1) * seg_dur
+            chunk = words[chunk_idx:chunk_idx + per]
+            chunk_idx += per
+            if k == n - 1:                       # 最后一段吃掉余下所有词
+                chunk = words[chunk_idx - per:]
+            if not chunk:
+                continue
+            out.append(_with_meta(cue, a, b, text=" ".join(chunk),
+                                  words=[], origin="split"))
+            report.oversize_split += 1
+        # oversize_split 这里按"新增段数"计，上面循环多记了一次，校正回来
+        report.oversize_split -= 1
+    return out
+
+
+def merge_tiny(cues: Sequence[Cue], cfg: FixConfig,
+               report: FixReport) -> List[Cue]:
+    """修 4：把"碎到不可用"的段并入相邻段。
+
+    切分与吸附可能产生几十毫秒的碎片（实测出现过 24ms），在 Aboboo 里
+    根本来不及看清。这里把时长 < ``tiny_ms`` 的段并入前一段（或下一段），
+    保证文本不丢。
+    """
+    if len(cues) < 2:
+        return list(cues)
+    tiny = cfg.tiny_duration_ms / 1000.0
+    if tiny <= 0:
+        return list(cues)
+    out = [cues[0]]
+    for c in cues[1:]:
+        if c.end - c.start < tiny:
+            prev = out[-1]
+            merged_text = f"{prev.text.strip()} {c.text.strip()}".strip()
+            out[-1] = _with_meta(prev, prev.start, max(prev.end, c.end),
+                                 text=merged_text,
+                                 words=list(prev.words) + list(c.words))
+            report.merged += 1
+        else:
+            out.append(c)
+    # 首条也过短时并入第二条
+    if len(out) >= 2 and (out[0].end - out[0].start) < tiny:
+        first, second = out[0], out[1]
+        out[1] = _with_meta(second, first.start, second.end,
+                            text=f"{first.text.strip()} {second.text.strip()}".strip(),
+                            words=list(first.words) + list(second.words))
+        out.pop(0)
+        report.merged += 1
+    return out
+
+
+def repair_all(cues: Sequence[Cue], boundaries: SpeechBoundaries,
+               cfg: FixConfig, report: FixReport,
+               media_duration: Optional[float] = None) -> List[Cue]:
+    """集中执行全部"可自动修复"的修复。
+
+    顺序有讲究：
+      钳制边界 -> 切超长 -> 并碎段 -> 延过短
+    先钳制保证时间合法；切分与合并会改变条数，之后才谈时长补足。
+    间隙/重叠由后续的 ``enforce_constraints`` 统一收口。
+    """
+    if media_duration is None and boundaries is not None:
+        media_duration = boundaries.duration or None
+    out = clamp_to_media(cues, media_duration, cfg, report)
+    out = split_oversized(out, boundaries, cfg, report)
+    out = merge_tiny(out, cfg, report)
+    out = extend_short(out, boundaries, cfg, report)
+    out.sort(key=lambda c: (c.start, c.end))
+    return out
+
+
 # ---------------------------------------------------------------- 主流程
 
 def fix_subtitles(segments: Sequence[Segment], boundaries: SpeechBoundaries,
@@ -730,23 +1002,27 @@ def fix_subtitles(segments: Sequence[Segment], boundaries: SpeechBoundaries,
     cues = drop_invalid(segments, cfg, report)
     baseline = list(cues)          # 供内容保真比对
 
-    step(0.25, "按静音切分合并段")
+    step(0.20, "按静音切分合并段")
     cues = split_by_silence(cues, boundaries, cfg, report)
 
-    step(0.50, "吸附到真实语音边界")
+    step(0.40, "吸附到真实语音边界")
     cues = snap_to_waveform(cues, boundaries, cfg, report)
 
-    step(0.70, "强制时长与间隙约束")
+    step(0.60, "修复全部可自动修复的错误")
+    cues = repair_all(cues, boundaries, cfg, report,
+                      media_duration=(boundaries.duration if boundaries else None))
+
+    step(0.75, "强制时长与间隙约束")
     cues = enforce_constraints(cues, cfg, report)
 
-    step(0.85, "行长约束")
+    step(0.88, "行长约束")
     cues = wrap_lines(cues, cfg, report)
 
     step(0.95, "校验")
     problems = self_check(cues, cfg)
     # 内容保真只在"没有切分"时才要求序列完全一致；
     # 切分后条数必然变化，所以这里只做顺序与相似度告警。
-    if report.split == 0:
+    if report.split == 0 and report.oversize_split == 0:
         problems += verify_against_baseline(cues, baseline)
     else:
         problems += [p for p in verify_against_baseline(cues, baseline)

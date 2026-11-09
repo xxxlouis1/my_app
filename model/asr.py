@@ -31,19 +31,49 @@ CancelFlag = Callable[[], bool]
 ProgressCb = Callable[[float, str], None]
 
 # 抑制静音段幻觉复读与失败循环的默认解码参数（实测验证）
+#
+# 参数分两类，对应本周两项需求：
+#   A. 辅助**对齐**：word_timestamps / vad_filter + vad_parameters /
+#      hallucination_silence_threshold
+#   B. 辅助**错误检测**：no_speech_threshold / compression_ratio_threshold /
+#      log_prob_threshold / temperature，配合 Segment 上的质量指标
 DEFAULT_DECODE = dict(
-    word_timestamps=True,
-    vad_filter=True,
-    condition_on_previous_text=False,
-    no_speech_threshold=0.6,
-    compression_ratio_threshold=2.4,
-    log_prob_threshold=-1.0,
+    # ---- A. 对齐相关 ----
+    word_timestamps=True,          # 词级时间戳：切分与吸附的前提
+    vad_filter=True,               # 用 VAD 边界过滤静音，减少幻觉
+    # VAD 参数：**保持 faster-whisper 默认（None）**。
+    # 实测教训：我一开始按"更灵敏"的直觉设成
+    #   min_silence_duration_ms=300, speech_pad_ms=200
+    # 结果反而**变差** —— Whisper 输出从 53 段塌成 39 段（更长的合并段），
+    # 后续按静音切分只能靠猜，文本更容易错位。
+    # faster-whisper 的默认是 min_silence_duration_ms=2000 / speech_pad_ms=400，
+    # 对本项目的跟读素材更合适。若换素材需重新测量，不要凭直觉调。
+    vad_parameters=None,
+    # 静音区间内出现的词时间戳视为幻觉并丢弃。
+    # 与 vad_filter 互补：VAD 过滤输入，这个过滤输出。
+    # 在干净素材上实测无副作用（段数/词数不变），作为噪声素材的兜底保留。
+    hallucination_silence_threshold=2.0,
+    # ---- B. 错误检测相关 ----
+    condition_on_previous_text=False,   # 关闭上下文，抑制"复读机"式幻觉循环
+    no_speech_threshold=0.6,            # 静音判定
+    compression_ratio_threshold=2.4,    # 重复循环判定
+    log_prob_threshold=-1.0,            # 低置信度判定
     temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+    beam_size=5,
+    best_of=5,
 )
 
 
 class AsrCancelled(RuntimeError):
     """转写被调用方主动取消。"""
+
+
+def _f(v) -> Optional[float]:
+    """安全转 float（None / 非法值 -> None），用于采集质量指标。"""
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _cuda_hint_if_relevant(exc: BaseException) -> Optional[str]:
@@ -80,10 +110,46 @@ class Segment:
     end: float
     text: str
     words: List[Word] = field(default_factory=list)
+    # ---- 质量指标（用于错误检测，全部来自 faster-whisper 的 Segment）----
+    avg_logprob: Optional[float] = None      # 平均对数概率，越低越可能识别错
+    no_speech_prob: Optional[float] = None   # 静音概率，高说明可能是幻觉
+    compression_ratio: Optional[float] = None  # 文本压缩比，高说明在重复循环
+    temperature: Optional[float] = None      # 实际使用的温度，>0 表示低温失败过
 
     @property
     def first_word_start(self) -> Optional[float]:
         return self.words[0].start if self.words else None
+
+    def quality(self, cfg: Optional["QualityThresholds"] = None) -> str:
+        """粗判质量等级：ok / suspect / bad。
+
+        依据是三项实测有力的指标（见 model/error_detect.py 的说明）：
+          · avg_logprob 低  -> 置信度不足，常见于噪声、口音、专有名词
+          · compression_ratio 高 -> 解码陷入重复循环（典型幻觉）
+          · temperature > 0.2 -> 说明低温解码失败了才升到这里，质量较差
+        """
+        cfg = cfg or QualityThresholds()
+        reasons = 0
+        if self.avg_logprob is not None and self.avg_logprob < cfg.logprob_suspect:
+            reasons += 1
+        if (self.compression_ratio is not None
+                and self.compression_ratio > cfg.compression_suspect):
+            reasons += 1
+        if self.temperature is not None and self.temperature > cfg.temperature_suspect:
+            reasons += 1
+        if reasons == 0:
+            return "ok"
+        return "suspect" if reasons == 1 else "bad"
+
+
+@dataclass
+class QualityThresholds:
+    """判定"识别可能出错"的阈值（可调，供 error_detect 使用）。"""
+
+    logprob_suspect: float = -0.8     # avg_logprob 低于此值 -> 可疑
+    logprob_bad: float = -1.2         # 低于此值 -> 很可能错
+    compression_suspect: float = 2.0  # 压缩比高于此值 -> 疑似重复循环
+    temperature_suspect: float = 0.2  # 温度高于此值 -> 低温解码曾失败
 
 
 @dataclass
@@ -223,8 +289,16 @@ class AsrEngine:
                     text = (raw.text or "").strip()
                     if not text and not words:
                         continue
-                    segments.append(Segment(start=float(raw.start), end=float(raw.end),
-                                            text=text, words=words))
+                    # 采集质量指标——这是"错误检测"的数据来源。
+                    # faster-whisper 的 Segment 自带这些字段，此前被丢弃了。
+                    segments.append(Segment(
+                        start=float(raw.start), end=float(raw.end),
+                        text=text, words=words,
+                        avg_logprob=_f(getattr(raw, "avg_logprob", None)),
+                        no_speech_prob=_f(getattr(raw, "no_speech_prob", None)),
+                        compression_ratio=_f(getattr(raw, "compression_ratio", None)),
+                        temperature=_f(getattr(raw, "temperature", None)),
+                    ))
 
                     if progress_cb and duration > 0:
                         pct = min(0.999, float(raw.end) / duration)

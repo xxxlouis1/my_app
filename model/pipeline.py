@@ -57,16 +57,26 @@ class ProcessResult:
     elapsed: float = 0.0
     report: Optional[FixReport] = None
     problems: List[str] = field(default_factory=list)
+    # 错误检测结果（供 GUI 的错误面板渲染，结构见 model/error_detect.py）
+    errors: List[dict] = field(default_factory=list)
+    error_summary: str = ""
 
     @property
     def ok(self) -> bool:
         return bool(self.srt_path) and not self.problems
+
+    @property
+    def remaining_errors(self) -> int:
+        """修正后仍存在的错误数（自动修正后正常应为 0 或极少）。"""
+        return len(self.errors)
 
     def summary(self) -> str:
         base = (f"{Path(self.video).name} -> {Path(self.srt_path).name}"
                 f"（{self.cue_count} 条字幕，{self.elapsed:.1f}s）")
         if self.problems:
             base += f"  警告 {len(self.problems)} 项"
+        if self.errors:
+            base += f"  未修错误 {len(self.errors)} 条"
         return base
 
 
@@ -210,11 +220,30 @@ def process(
         step(0.90, "写出 SRT")
         write_srt(cues, str(srt_path))
 
+        # --- 5b. 错误检测（供 GUI 错误面板）
+        # 在 seconv 规范化之前检测：此时 cues 还带着 ASR 的质量指标，
+        # 检测结果能精确关联到字幕编号。
+        step(0.92, "检测剩余错误")
+        try:
+            from .error_detect import detect_errors
+            err = detect_errors(cues, boundaries, fix_config or FixConfig(),
+                                media_duration=boundaries.duration or None)
+            result.errors = err.to_gui_items()
+            result.error_summary = err.summary()
+            log.info("错误检测：%s", err.summary())
+            if err.errors:
+                for e in err.errors[:5]:
+                    log.warning("序%d [%s] %s", e.subtitle_no,
+                                e.error_type, e.message)
+        except Exception as e:
+            # 检测属增强功能，失败不能影响主产物
+            log.warning("错误检测失败（不影响输出）：%s", e)
+
         # --- 6. Subtitle Edit（seconv）规范化 —— 需求第 3 条
         # 放在吸附之后：吸附负责对齐（决定因素），seconv 负责字幕工程规范收尾。
         # 内部会校验结果，不合格自动回滚，不影响已对齐的产物。
         if fix_config is None or getattr(fix_config, "seconv_enabled", True):
-            step(0.93, "Subtitle Edit 规范化")
+            step(0.94, "Subtitle Edit 规范化")
             normalize_with_seconv(
                 str(srt_path), fix_config or FixConfig(), fix_progress)
 
