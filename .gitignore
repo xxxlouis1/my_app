@@ -38,3 +38,9 @@ test.mp4
 .idea/
 Thumbs.db
 desktop.ini
+
+# ---- SSH Ë½Ô¿£¨¾ø²»Ìá½»£©----
+.ssh/
+*.pem
+id_rsa*
+id_ed25519*
