@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -43,6 +44,7 @@ from controller.qt_worker import JobRow, SchedulerWorker
 from controller.scheduler import JobState
 from view.srt_preview import SrtPreviewWidget
 from view.whisper_panel import WhisperPanel
+from view.waveform_panel import WaveformPanel
 
 
 class MainWindow(QMainWindow):
@@ -59,6 +61,10 @@ class MainWindow(QMainWindow):
 
         self.worker = SchedulerWorker()
         self._connect_worker()
+
+        self.waveform_panel = WaveformPanel()
+        self.waveform_panel.saveRequested.connect(self._on_save_waveform)
+        self.waveform_panel.canvas.cueChanged.connect(self._on_cues_changed)
 
         self._build_ui()
         self._setup_loading_animation()
@@ -109,7 +115,11 @@ class MainWindow(QMainWindow):
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setSizes([460, 640])
-        root.addWidget(splitter, stretch=1)
+
+        tabs = QTabWidget()
+        tabs.addTab(splitter, "字幕校正")
+        tabs.addTab(self.waveform_panel, "波形编辑")
+        root.addWidget(tabs, stretch=1)
 
         root.addWidget(self._build_button_bar())
 
@@ -220,8 +230,9 @@ class MainWindow(QMainWindow):
             return
         self.video_path = path
         self.video_edit.setText(path)
-        # 切换视频时清空字幕预览
+        # 切换视频时清空字幕预览与波形
         self.srt_preview.clear()
+        self.waveform_panel.clear()
         self._log("info", f"已选择视频：{os.path.basename(path)}")
 
     def _choose_srt(self):
@@ -251,6 +262,7 @@ class MainWindow(QMainWindow):
             self._log("error", f"加载 SRT 失败：{err}")
             return
         self._log("info", f"已加载字幕 {count} 条：{os.path.basename(self.srt_path)}")
+        self.waveform_panel.set_cues(self.srt_preview.cues())
         if count == 0:
             QMessageBox.warning(self, "提示", "该 SRT 未解析出任何字幕，请检查格式。")
 
@@ -316,7 +328,28 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("%p%")
         self.status_label.setText("就绪")
         self.srt_preview.clear()
+        self.waveform_panel.clear()
         self._log("info", "已清空任务与预览")
+
+    # ------------------------------------------------------------ 波形编辑
+    def set_waveform(self, original, processed=None):
+        """后端(成员3/4) 产出波形采样数据后调用，把数据喂给波形画布。"""
+        self.waveform_panel.set_tracks(original, processed)
+
+    def _on_cues_changed(self):
+        # 断点被拖动后，实时同步字幕预览表格
+        self.srt_preview.set_cues(self.waveform_panel.cues())
+
+    def _on_save_waveform(self, cues):
+        # TODO(成员2): 在这里接收断点新时间 → 校验时间合法性 → 组装标准 SRT → 另存文件。
+        # GUI 只负责收集修改后的断点并交出去，不组装 SRT、不做校验。
+        for c in cues:
+            self._log("info", f"断点 #{c.index}: {c.start} --> {c.end}  {c.text[:24]}")
+        self._log("info", f"已收集 {len(cues)} 条字幕的断点，等待后端(成员2)组装保存。")
+        QMessageBox.information(
+            self, "保存",
+            f"已收集 {len(cues)} 条字幕的断点时间。\n\n"
+            "SRT 组装与另存由「成员2」实现，GUI 已把数据备好。")
 
     # ------------------------------------------------------------ worker 信号
     def _on_job_updated(self, job):
