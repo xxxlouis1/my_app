@@ -75,7 +75,18 @@ class FixConfig:
 
     # 波形相关
     min_speech: float = 0.10          # 短于此的语音段视为噪声碎片（切分用）
-    min_anchor_speech: float = 0.30   # 锚点用的更严阈值（吸附用）
+    # 锚点用的最短语音段。
+    # 原值 0.30 是在 test.mp4（跟读素材，语音段中位 1077ms）上标定的；
+    # 换到 Muzzy 卡通（语音段中位 334ms）后，0.30 把 598 段砍到 313 段，
+    # 一半正常短句被当噪声丢弃，实测"无语音覆盖"误报从 6 涨到 17。
+    # 因此降到 0.15（仍能滤掉 27~96ms 的噪声碎片）。
+    min_anchor_speech: float = 0.15
+    # 超过此时长的语音区间视为"连续声音"（背景音乐、持续音效），
+    # 不能当作"一句话"：
+    #   · 不能用它的结束去延长字幕终点（会把字幕拉长到几十秒）
+    #   · 不能用它判定"时间轴偏移 / 终点未覆盖"（否则全是误报）
+    # 实测 Muzzy 中出现过 19s、57s 的区间。
+    max_region_sec: float = 6.0
     merge_gap: float = 0.30           # 间隔小于此的语音段合并（供边界分析使用）
     split_gap: float = 0.80           # 词间停顿超过此值即视为句间边界（切分兜底）
     snap_tolerance: float = 3.0       # 吸附容差（秒），超出则放弃吸附
@@ -496,13 +507,20 @@ def snap_to_waveform(cues: Sequence[Cue], boundaries: SpeechBoundaries,
         # 恰好把每个更晚的真实终点都排除掉了，于是字幕总是提前消失。
         #
         # 字幕的职责是覆盖整句话，所以终点应当延长到该语音区间的结束。
+        #
+        # 但**超长区间不能这么干**：Muzzy 这类含背景音乐的素材上，
+        # silencedetect 会把 19s、57s 的连续声音算成一个"区间"，若据此延长
+        # 会把字幕拉成几十秒。这类区间只当作"有声音"，不作为句子边界。
         nb = cue.end
         if region is not None:
+            region_len = region[1] - region[0]
             cand = region[1]
-            if cand >= cue.end and (cand - cue.end) <= cfg.snap_tolerance:
-                if cand - na <= cfg.max_duration_ms / 1000.0:
-                    nb = cand
-                    report.snapped_end += 1
+            if (region_len <= cfg.max_region_sec
+                    and cand >= cue.end
+                    and (cand - cue.end) <= cfg.snap_tolerance
+                    and cand - na <= cfg.max_duration_ms / 1000.0):
+                nb = cand
+                report.snapped_end += 1
         if nb == cue.end:
             # 兜底：没有归属区间时，退化为"取 <= 终点的最近语音终点"
             j = bisect.bisect_right(offsets, cue.end)

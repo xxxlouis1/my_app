@@ -235,6 +235,10 @@ def detect_errors(
                     False, "需拆分或精简文本，自动修正不动文本", 1)
 
         # ---------- 4. 与波形比对（时间轴类）----------
+        # 重要前提：只有"短区间"才代表一句话。含背景音乐的素材里
+        # silencedetect 会产出 19s、57s 的超长区间（实测 Muzzy 卡通），
+        # 此时"起点偏离区间起点""终点早于区间结束"都是**必然且正常**的，
+        # 拿它判定就是误报。超长区间只用于确认"这段时间里确实有声音"。
         if anchors and c.end > c.start:
             reg = _region_of(c.start, anchors)
             if reg is None:
@@ -245,21 +249,29 @@ def detect_errors(
                     "自动修正会吸附到最近的语音起点", 3)
             else:
                 a, b = reg
-                off = c.start - a
-                # 容差换算成秒（FixConfig.snap_tolerance 单位是秒）
-                tol = cfg.snap_tolerance
-                if off > tol and off > 0.15:
-                    add(i, ET_OFFSET,
-                        f"起点比语音起点晚 {off*1000:.0f}ms", ts, True,
-                        "自动修正会吸附到语音起点", 2)
-                elif off < -0.15:
-                    add(i, ET_OFFSET,
-                        f"起点比语音起点早 {-off*1000:.0f}ms", ts, True,
-                        "自动修正会吸附到语音起点", 2)
-                if b - c.end > 0.25:
-                    add(i, ET_END_SHORT,
-                        f"终点早于语音结束 {(b-c.end)*1000:.0f}ms", ts, True,
-                        "自动修正会把终点延到语音结束", 2)
+                if (b - a) <= cfg.max_region_sec:
+                    off = c.start - a
+                    # 容差换算成秒（FixConfig.snap_tolerance 单位是秒）
+                    tol = cfg.snap_tolerance
+                    if off > tol and off > 0.15:
+                        add(i, ET_OFFSET,
+                            f"起点比语音起点晚 {off*1000:.0f}ms", ts, True,
+                            "自动修正会吸附到语音起点", 2)
+                    elif off < -0.15:
+                        add(i, ET_OFFSET,
+                            f"起点比语音起点早 {-off*1000:.0f}ms", ts, True,
+                            "自动修正会吸附到语音起点", 2)
+                    if b - c.end > 0.25:
+                        add(i, ET_END_SHORT,
+                            f"终点早于语音结束 {(b-c.end)*1000:.0f}ms", ts, True,
+                            "自动修正会把终点延到语音结束", 2)
+                else:
+                    # 超长区间（背景音乐/连续音效）：只确认有声音，不做精判
+                    if _speech_overlap(c.start, c.end, [reg]) <= 0.05:
+                        add(i, ET_NO_SPEECH,
+                            f"该时间段内检测不到语音（所在区间 {(b-a):.0f}s，"
+                            f"疑似音乐）", ts, False,
+                            "含音乐/音效的素材难以自动判定，建议人工核对", 2)
 
         # ---------- 5. ASR 置信度（识别类）----------
         if c.avg_logprob is not None and c.avg_logprob < q.logprob_suspect:
