@@ -30,20 +30,44 @@ class VideoCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._subtitle = ""
+        self._image = None          # 真实视频帧（QImage），由播放器推送
         self.setMinimumHeight(220)
 
     def set_subtitle(self, text: str):
         self._subtitle = text
         self.update()
 
+    def set_image(self, image):
+        """接收真实视频帧（由 media_processing.PlaybackController.frame_ready 推送）。
+
+        传 None 会退回占位画面。
+        """
+        self._image = image
+        self.update()
+
+    def clear_image(self):
+        self._image = None
+        self.update()
+
     def _video_rect(self) -> QRectF:
+        """画面绘制区域：有真实帧时按帧宽高比留黑边，否则按 16:9 占位。"""
         w = self.width()
         h = self.height()
-        target_h = w * 9.0 / 16.0
+        aspect = 16.0 / 9.0
+        if self._image is not None:
+            iw = getattr(self._image, "width", None)
+            ih = getattr(self._image, "height", None)
+            try:
+                iw, ih = int(iw()), int(ih())
+            except TypeError:
+                iw = ih = 0
+            if iw > 0 and ih > 0:
+                aspect = iw / float(ih)
+        target_h = w / aspect
         if target_h <= h:
             vw, vh = w, target_h
         else:
-            vw, vh = h * 16.0 / 9.0, h
+            vw, vh = h * aspect, h
         return QRectF((w - vw) / 2.0, (h - vh) / 2.0, vw, vh)
 
     def paintEvent(self, event):
@@ -56,11 +80,16 @@ class VideoCanvas(QWidget):
         p.setPen(QColor("#2a2a2a"))
         p.drawRect(r)
 
-        p.setPen(QColor("#555555"))
-        f = QFont()
-        f.setPointSize(14)
-        p.setFont(f)
-        p.drawText(r, Qt.AlignmentFlag.AlignCenter, "视频画面")
+        if self._image is not None:
+            # 保持宽高比缩放绘制，不拉伸变形
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.drawImage(r, self._image)
+        else:
+            p.setPen(QColor("#555555"))
+            f = QFont()
+            f.setPointSize(14)
+            p.setFont(f)
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "视频画面")
 
         if self._subtitle:
             self._draw_subtitle(p, r)

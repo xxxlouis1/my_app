@@ -93,6 +93,17 @@ class AbobooView(QWidget):
         self._duration = track.duration if track else 0.0
         self.full_plot.set_track(track)
 
+    def set_segment_waveform(self, track: Optional[WaveformTrack]):
+        """设置单句（第 2 分区）波形。
+
+        原实现只调 ``sentence_plot.set_view()`` 而从未喂数据，
+        所以单句波形区永远是空的。由主窗口在选中字幕时用
+        ``media_processing.build_segment_track`` 切片后调用本方法。
+        """
+        self.sentence_plot.set_track(track)
+        if track is not None and track.duration > 0:
+            self.sentence_plot.set_view(0.0, track.duration)
+
     def set_subtitles(self, items: List[SubtitleItem]):
         """成员2 产出字幕条目（含错误标注）后调用。"""
         self._items = list(items)
@@ -146,7 +157,11 @@ class AbobooView(QWidget):
         start_s = item.start_ms / 1000.0
         end_s = item.end_ms / 1000.0
         pad = max(0.3, (end_s - start_s) * 0.3)
-        self.sentence_plot.set_view(start_s - pad, end_s + pad)
+        # 单句波形：如果主窗口已喂入"该句的切片轨"（0~句长），
+        # 就不要再按绝对时间 set_view，否则会把切片轨的视野算错。
+        # 没有切片轨时退回"在全片波形上缩放到该句"。
+        if getattr(self.sentence_plot, "_track", None) is None:
+            self.sentence_plot.set_view(start_s - pad, end_s + pad)
         self.full_plot.set_selection(start_s, end_s)
         if self._duration > 0:
             self.brace.set_span(start_s / self._duration, end_s / self._duration)

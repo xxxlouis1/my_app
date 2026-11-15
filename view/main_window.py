@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -42,9 +42,47 @@ from PySide6.QtWidgets import (
 
 from controller.qt_worker import JobRow, SchedulerWorker
 from controller.scheduler import JobState
+from view.aboboo_view import AbobooView
 from view.srt_preview import SrtPreviewWidget
+from view.subtitle_model import ErrorInfo, SubtitleItem
 from view.whisper_panel import WhisperPanel
 from view.waveform_panel import WaveformPanel
+
+
+class WaveformWorker(QThread):
+    """后台生成波形，避免解码整段音频时界面卡死。
+
+    同时顺带算出音频的语音边界（供错误检测用），因为两者都要解码音频，
+    合并到一个线程里做可以少跑一遍。
+    """
+
+    done = Signal(object, object, object)   # (原始轨, 处理后轨, SpeechBoundaries)
+    failed = Signal(str)
+
+    def __init__(self, video_path: str, processed_media: str = "",
+                 target_points: int = 2000, parent=None):
+        super().__init__(parent)
+        self._video = video_path
+        self._processed = processed_media or None
+        self._target = target_points
+
+    def run(self):
+        try:
+            from media_processing import build_tracks
+            original, processed = build_tracks(
+                self._video, processed_media=self._processed,
+                target_points=self._target)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+            return
+        # 语音边界：失败不影响波形（属增强信息）
+        boundaries = None
+        try:
+            from model.waveform import extract_boundaries
+            boundaries = extract_boundaries(self._video)
+        except Exception:
+            boundaries = None
+        self.done.emit(original, processed, boundaries)
 
 
 class MainWindow(QMainWindow):
@@ -58,6 +96,11 @@ class MainWindow(QMainWindow):
         self.out_dir = ""
         self._processing = False
         self._job_rows = {}   # job_id -> 表格行号
+        # 播放/波形相关状态（由成员3 的 media_processing 驱动）
+        self._playback = None
+        self._wave_worker = None
+        self._boundaries = None      # SpeechBoundaries，供错误检测用
+        self._duration = 0.0
 
         self.worker = SchedulerWorker()
         self._connect_worker()
@@ -68,6 +111,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._setup_loading_animation()
+        self._setup_playback()
 
     # ------------------------------------------------------------ 构造
     def _connect_worker(self):
@@ -82,6 +126,157 @@ class MainWindow(QMainWindow):
         self._loading_timer = QTimer(self)
         self._loading_timer.setInterval(400)
         self._loading_timer.timeout.connect(self._tick_loading)
+
+    # ------------------------------------------------------------ 播放与波形
+    def _setup_playback(self):
+        """接成员3 的播放控制器到 Aboboo 界面。
+
+        失败（未装 ffmpeg / 无 PySide6 绑定等）只写日志并禁用预览，
+        不影响字幕校正主流程。
+        """
+        try:
+            from media_processing import create_playback_controller
+            self._playback = create_playback_controller(self)
+        except Exception as e:
+            self._playback = None
+            self._log("warning", f"视频预览不可用：{e}")
+            return
+
+        vp = self.aboboo_view.video_panel
+        self._playback.frame_ready.connect(vp.canvas.set_image)
+        self._playback.position_changed.connect(self._on_position_changed)
+        self._playback.finished.connect(lambda: vp.set_playing(False))
+        self._playback.error.connect(lambda m: self._log("error", f"视频预览失败：{m}"))
+
+        vp.playPauseRequested.connect(self._on_play_pause)
+        vp.seekRequested.connect(self._on_seek_frac)
+        # 点击波形 → 跳转播放位置
+        self.aboboo_view.seekRequested.connect(self._on_seek_seconds)
+        # 选中字幕 → 第 2 分区显示该句的切片波形
+        self.aboboo_view.subtitle_list.selected.connect(self._on_subtitle_selected)
+        self._log("info", "视频预览已就绪")
+
+    def _on_subtitle_selected(self, item):
+        """选中某条字幕 → 切片出该句波形，喂给单句波形区。
+
+        复用成员3 的 ``WaveformProcessor`` 缓存（同一进程内只解码一次），
+        所以连续点击不同句子不会重复解码整段音频。
+        """
+        if not self.video_path or item is None:
+            return
+        try:
+            from media_processing import build_segment_track, to_gui_track
+            seg = build_segment_track(
+                self.video_path,
+                item.start_ms / 1000.0,
+                item.end_ms / 1000.0,
+                target_points=1000,
+            )
+            try:
+                seg = to_gui_track(seg)
+            except Exception:
+                pass
+            self.aboboo_view.set_segment_waveform(seg)
+        except Exception as e:
+            self._log("warning", f"单句波形生成失败：{e}")
+
+    def _on_play_pause(self):
+        if self._playback is None:
+            self._log("warning", "播放器未就绪，无法播放")
+            return
+        self._playback.toggle()
+        self.aboboo_view.video_panel.set_playing(self._playback.is_playing)
+
+    def _on_position_changed(self, frac: float):
+        dur = self._playback.duration if self._playback else 0.0
+        if dur > 0:
+            self.aboboo_view.set_playhead(frac * dur)
+            self.waveform_panel.set_playhead_frac(frac)
+
+    def _on_seek_frac(self, frac: float):
+        if self._playback is not None:
+            self._playback.seek(frac)
+            self.aboboo_view.video_panel.set_position(frac)
+
+    def _on_seek_seconds(self, t_sec: float):
+        if self._playback is not None and self._playback.duration > 0:
+            frac = max(0.0, min(1.0, t_sec / self._playback.duration))
+            self._playback.seek(frac)
+            self.aboboo_view.video_panel.set_position(frac)
+
+    def _load_global_waveform(self):
+        """选视频后生成双轨波形（后台线程，避免界面卡顿）。"""
+        if not self.video_path:
+            return
+        if self._wave_worker is not None and self._wave_worker.isRunning():
+            self._log("warning", "波形正在生成中，请稍候")
+            return
+        self.waveform_panel.status_label.setText("波形生成中…")
+        self._log("info", f"开始生成波形：{os.path.basename(self.video_path)}")
+        self._wave_worker = WaveformWorker(self.video_path, parent=self)
+        self._wave_worker.done.connect(self._on_waveform_ready)
+        self._wave_worker.failed.connect(self._on_waveform_failed)
+        self._wave_worker.start()
+
+    def _on_waveform_ready(self, original, processed, boundaries):
+        from media_processing import to_gui_track
+        try:
+            o = to_gui_track(original)
+            p = to_gui_track(processed)
+        except Exception:
+            o, p = original, processed        # 鸭子类型兜底
+        self._duration = getattr(original, "duration", 0.0) or 0.0
+        self._boundaries = boundaries
+        # 波形编辑页（双轨）
+        self.waveform_panel.set_tracks(o, p)
+        # Aboboo 页（总波形，单轨）
+        self.aboboo_view.set_waveform(o)
+        self._log("info", f"波形已生成：{len(getattr(o, 'peaks', []) or [])} 点，"
+                          f"{self._duration:.1f}s")
+        # 波形就绪后刷新字幕列表（错误检测依赖语音边界）
+        self._refresh_aboboo_subtitles()
+
+    def _on_waveform_failed(self, msg: str):
+        self.waveform_panel.status_label.setText("波形生成失败")
+        self._log("warning", f"波形生成失败：{msg}")
+
+    def _refresh_aboboo_subtitles(self):
+        """把当前 SRT 以 SubtitleItem（含错误标注）喂给 Aboboo 界面。"""
+        if not self.srt_path or not os.path.isfile(self.srt_path):
+            return
+        try:
+            from model.error_detect import detect_errors
+            from model.subtitle_fix import read_srt_cues
+
+            cues = read_srt_cues(self.srt_path)
+            err_index = {}
+            remaining = 0
+            if cues:
+                rep = detect_errors(cues, self._boundaries,
+                                    media_duration=self._duration or None)
+                err_index = rep.to_index()
+                remaining = len(rep.errors)
+                self._log("info", f"字幕检查：{rep.summary()}")
+
+            items = []
+            for i, c in enumerate(cues, 1):
+                errs = err_index.get(i) or []
+                err = None
+                if errs:
+                    e0 = errs[0]
+                    err = ErrorInfo(
+                        subtitle_no=e0["subtitle_no"],
+                        error_type=e0["error_type"],
+                        message="；".join(x["message"] for x in errs[:3]),
+                        timestamp_ms=e0.get("timestamp_ms", 0))
+                items.append(SubtitleItem(
+                    no=i, start_ms=c.start_ms, end_ms=c.end_ms,
+                    text=c.text, error=err))
+            self.aboboo_view.set_subtitles(items)
+            if remaining == 0:
+                self._log("info", "未发现可判定的错误")
+        except Exception as e:
+            self._log("warning", f"字幕列表刷新失败：{e}")
 
     # ------------------------------------------------------------ UI
     def _build_ui(self):
@@ -117,8 +312,11 @@ class MainWindow(QMainWindow):
         splitter.setSizes([460, 640])
 
         tabs = QTabWidget()
+        self.aboboo_view = AbobooView()
+        tabs.addTab(self.aboboo_view, "Aboboo 界面")
         tabs.addTab(splitter, "字幕校正")
         tabs.addTab(self.waveform_panel, "波形编辑")
+        self.tabs = tabs
         root.addWidget(tabs, stretch=1)
 
         root.addWidget(self._build_button_bar())
@@ -233,7 +431,16 @@ class MainWindow(QMainWindow):
         # 切换视频时清空字幕预览与波形
         self.srt_preview.clear()
         self.waveform_panel.clear()
+        self.aboboo_view.clear()
+        self._boundaries = None
         self._log("info", f"已选择视频：{os.path.basename(path)}")
+        # 载入播放器（视频预览）+ 后台生成波形
+        if self._playback is not None:
+            if self._playback.load(path):
+                self._log("info", "播放器已加载该视频")
+            else:
+                self._log("warning", "播放器无法打开该视频（可能编码不支持）")
+        self._load_global_waveform()
 
     def _choose_srt(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -263,6 +470,8 @@ class MainWindow(QMainWindow):
             return
         self._log("info", f"已加载字幕 {count} 条：{os.path.basename(self.srt_path)}")
         self.waveform_panel.set_cues(self.srt_preview.cues())
+        # 同步到 Aboboo 界面（含错误标注）
+        self._refresh_aboboo_subtitles()
         if count == 0:
             QMessageBox.warning(self, "提示", "该 SRT 未解析出任何字幕，请检查格式。")
 
@@ -341,15 +550,88 @@ class MainWindow(QMainWindow):
         self.srt_preview.set_cues(self.waveform_panel.cues())
 
     def _on_save_waveform(self, cues):
-        # TODO(成员2): 在这里接收断点新时间 → 校验时间合法性 → 组装标准 SRT → 另存文件。
-        # GUI 只负责收集修改后的断点并交出去，不组装 SRT、不做校验。
-        for c in cues:
-            self._log("info", f"断点 #{c.index}: {c.start} --> {c.end}  {c.text[:24]}")
-        self._log("info", f"已收集 {len(cues)} 条字幕的断点，等待后端(成员2)组装保存。")
+        """把波形上拖动后的断点组装成标准 SRT 并另存。
+
+        职责划分（对应分工表）：
+          · GUI 只负责收集断点并交出来（不做业务逻辑）
+          · 这里做**时间合法性校验**（负数、重叠、逆序、零时长）—— 归成员2/4
+          · 组装与写盘复用成员3 的 ``SRTExporter``（Aboboo 规范、UTF-8 无 BOM）
+        """
+        if not cues:
+            QMessageBox.warning(self, "提示", "没有可保存的字幕。")
+            return
+
+        # ---- 1. 整理并按时间排序
+        rows = sorted(
+            ({"no": getattr(c, "index", i + 1),
+              "start": int(round(getattr(c, "start_ms", 0))),
+              "end": int(round(getattr(c, "end_ms", 0))),
+              "text": (getattr(c, "text", "") or "").strip()}
+             for i, c in enumerate(cues)),
+            key=lambda r: (r["start"], r["end"]))
+
+        # ---- 2. 时间合法性校验与修正
+        problems = []
+        min_gap = 24          # 与字幕参数一致（毫秒）
+        min_dur = 200
+        prev_end = None
+        for i, r in enumerate(rows, 1):
+            if r["start"] < 0:
+                problems.append(f"#{i} 起始时间为负，已钳制到 0")
+                r["start"] = 0
+            if r["end"] <= r["start"]:
+                problems.append(f"#{i} 结束时间不晚于开始，已按最短时长修正")
+                r["end"] = r["start"] + min_dur
+            if prev_end is not None and r["start"] < prev_end + min_gap:
+                if r["start"] < prev_end:
+                    problems.append(
+                        f"#{i} 与前一条重叠 {(prev_end - r['start'])}ms，已避让")
+                    r["start"] = prev_end + min_gap
+                    if r["end"] <= r["start"]:
+                        r["end"] = r["start"] + min_dur
+                # 间隙不足时不再强推（拖动是用户意图，只提示不篡改）
+            prev_end = r["end"]
+            if not r["text"]:
+                problems.append(f"#{i} 文本为空（仍保留，Aboboo 会跳过）")
+
+        if problems:
+            detail = "\n".join(f"· {p}" for p in problems[:10])
+            more = f"\n…还有 {len(problems) - 10} 条" if len(problems) > 10 else ""
+            self._log("warning", f"保存前自动修正 {len(problems)} 处：\n{detail}{more}")
+
+        # ---- 3. 选择保存位置
+        base = os.path.splitext(os.path.basename(self.srt_path or "subtitle"))[0]
+        default_dir = os.path.dirname(self.srt_path) if self.srt_path else (
+            self.out_dir or os.path.expanduser("~"))
+        default_path = os.path.join(default_dir, f"{base}_corrected.srt")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存字幕", default_path, "SRT 字幕 (*.srt)")
+        if not path:
+            return
+        if not path.lower().endswith(".srt"):
+            path += ".srt"
+
+        # ---- 4. 组装并写盘（复用成员3 的导出器，保证 Aboboo 规范）
+        # 注意：SRTExporter 默认 encoding="utf-8-sig"（带 BOM）。本项目其余环
+        # 一律输出 UTF-8 **无 BOM**，为免同一次交付里格式不一致，这里显式改回
+        # utf-8。BOM 对 Aboboo 是否友好双方都未实测，保持与既有产物一致最稳。
+        try:
+            from media_processing import SRTExporter, Subtitle
+            subs = [Subtitle(index=i, start=r["start"] / 1000.0,
+                             end=r["end"] / 1000.0, text=r["text"])
+                    for i, r in enumerate(rows, 1)]
+            exported = SRTExporter(encoding="utf-8").export(
+                subs, path, validate=True, renumber=True)
+        except Exception as e:
+            self._log("error", f"SRT 导出失败：{e}")
+            QMessageBox.critical(self, "保存失败", f"无法写出 SRT：\n{e}")
+            return
+
+        self._log("info", f"已保存 {len(rows)} 条字幕到：{exported}")
         QMessageBox.information(
-            self, "保存",
-            f"已收集 {len(cues)} 条字幕的断点时间。\n\n"
-            "SRT 组装与另存由「成员2」实现，GUI 已把数据备好。")
+            self, "保存成功",
+            f"已保存 {len(rows)} 条字幕：\n{exported}"
+            + ("\n\n注：保存前自动修正了部分时间问题，详见日志。" if problems else ""))
 
     # ------------------------------------------------------------ worker 信号
     def _on_job_updated(self, job):

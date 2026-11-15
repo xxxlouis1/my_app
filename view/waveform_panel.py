@@ -72,6 +72,14 @@ class WaveformPanel(QWidget):
     def cues(self):
         return self.canvas.cues()
 
+    def set_playhead(self, t_sec):
+        """设置播放头（秒）。由 PlaybackController.position_changed 驱动。"""
+        self.canvas.set_playhead(t_sec)
+
+    def set_playhead_frac(self, frac: float):
+        """按 0~1 比例设置播放头，与 VideoPanel.set_position(frac) 同口径。"""
+        self.canvas.set_playhead_frac(frac)
+
     def clear(self):
         self.canvas.clear()
         self.status_label.setText("未加载波形")

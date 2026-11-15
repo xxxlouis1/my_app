@@ -70,7 +70,36 @@ class WaveformCanvas(QWidget):
         self._view_start = 0.0
         self._view_end = 1.0
         self._drag: Optional[dict] = None
+        # 播放头位置（秒）。由 PlaybackController.position_changed 驱动，
+        # 用于"播放时波形上有一条竖线跟着走"。
+        self._playhead: Optional[float] = None
         self.setMouseTracking(True)
+
+    # ------------------------------------------------------------ 播放头
+    def set_playhead(self, t_sec: Optional[float]):
+        """设置播放头时间（秒）。传 None 则隐藏。
+
+        播放头只需要重绘受影响的两条竖线，但 Qt 的 update() 是按控件区域；
+        这里直接整块重绘——画布本身绘制量很小（几千个线段），实测无卡顿。
+        """
+        if t_sec is None:
+            if self._playhead is None:
+                return
+            self._playhead = None
+        else:
+            t = max(0.0, float(t_sec))
+            if self._playhead is not None and abs(t - self._playhead) < 1e-4:
+                return
+            self._playhead = t
+        self.update()
+
+    def set_playhead_frac(self, frac: float):
+        """按 0~1 比例设置播放头（与 VideoPanel.set_position 口径一致）。"""
+        if self._duration > 0:
+            self.set_playhead(max(0.0, min(1.0, float(frac))) * self._duration)
+
+    def playhead_time(self) -> Optional[float]:
+        return self._playhead
 
     # ------------------------------------------------------------ 对外数据
     def set_tracks(self, original: Optional[WaveformTrack],
@@ -200,6 +229,21 @@ class WaveformCanvas(QWidget):
         if self._cues:
             self._draw_cue_lane(p, H - cue_h, cue_h)
         self._draw_axis(p, AXIS_PX)
+        self._draw_playhead(p, W, H)
+
+    def _draw_playhead(self, p, W, H):
+        """播放头：一条贯穿全高的竖线 + 顶部时间标签。"""
+        if self._playhead is None or self._duration <= 0:
+            return
+        x = self._time_to_x(self._playhead)
+        if x < 0 or x > W:
+            return
+        p.setPen(QPen(QColor("#00e5ff"), 1.5))
+        p.drawLine(QPointF(x, 0), QPointF(x, H))
+        # 顶部时间标签
+        p.setPen(QColor("#00e5ff"))
+        label = WaveformCanvas._fmt_tick(self._playhead)
+        p.drawText(int(min(max(x + 3, 0), W - 48)), 12, label)
 
     def _draw_track(self, p, track, top, height, color):
         if not track or not track.peaks:

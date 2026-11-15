@@ -4,7 +4,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# ---- pip 缓存与临时目录（沙箱环境下会重定向到工作区，绝不可提交）----
+# ---- pip 缓存与临时目录（受限环境下会重定向到工作区，绝不可提交）----
 .pipcache/
 .tmp/
 pip-*.log
@@ -22,6 +22,22 @@ models/
 # ---- 随程序分发的第三方工具（seconv.exe 约 81MB，按需下载）----
 tools/
 
+# ---- 发布成品（PyInstaller 打包目录，约 1GB，绝不提交）----
+MP4字幕矫正工具_v3.1_Aboboo对照版/
+*对照版/
+dist/
+build/
+*.spec
+
+# ---- 模块备份（整合过程中的临时备份）----
+media_processing.bak/
+
+# ---- SSH 私钥（绝不提交）----
+.ssh/
+*.pem
+id_rsa*
+id_ed25519*
+
 # ---- 运行产物与日志 ----
 logs/
 test_output/
@@ -38,9 +54,5 @@ test.mp4
 .idea/
 Thumbs.db
 desktop.ini
-
-# ---- SSH ˽Կ�������ύ��----
-.ssh/
-*.pem
-id_rsa*
-id_ed25519*
+# ---- 成员3 原始交付包（已整合进 media_processing/）----
+音视频处理模块_成员3*/
