@@ -37,6 +37,7 @@ class WaveformPlot(QWidget):
         self._view_end = 1.0
         self._selection: Optional[Tuple[float, float]] = None  # 秒
         self._playhead: Optional[float] = None                 # 秒
+        self._highlight: Optional[Tuple[float, float]] = None  # 秒，正在读的句子区间
 
     # ------------------------------------------------------------ 对外
     def set_track(self, track: Optional[WaveformTrack]):
@@ -58,6 +59,15 @@ class WaveformPlot(QWidget):
         self._selection = (start, end)
         self.update()
 
+    def set_highlight(self, start: float, end: float):
+        """高亮区间（秒）：正在读的那句保持亮色，区间外（前后未读）变暗。"""
+        self._highlight = (start, end)
+        self.update()
+
+    def clear_highlight(self):
+        self._highlight = None
+        self.update()
+
     def set_playhead(self, t: float):
         self._playhead = t
         self.update()
@@ -67,6 +77,7 @@ class WaveformPlot(QWidget):
         self._envelope = []
         self._selection = None
         self._playhead = None
+        self._highlight = None
         self.update()
 
     # ------------------------------------------------------------ 交互
@@ -155,9 +166,16 @@ class WaveformPlot(QWidget):
         mid = H / 2.0
         amp = H * 0.45
 
-        # 1) 深蓝色块状底：填充 min~max 区域
+        # 每一列是否落在「正在读」区间内；区间外（前后未读）用暗色
+        hl = [False] * W
+        if self._highlight is not None:
+            hs, he = self._highlight
+            for x in range(W):
+                t = t0 + (x / W) * span
+                hl[x] = hs <= t <= he
+
+        # 1) 块状底：正在读=亮蓝底，未读=暗蓝底
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#16325c"))
         for x in range(W):
             if not has[x]:
                 continue
@@ -165,28 +183,32 @@ class WaveformPlot(QWidget):
             y_bot = mid - mins[x] * amp
             if y_bot - y_top < 1.0:
                 y_bot = y_top + 1.0
+            p.setBrush(QColor("#16325c") if hl[x] else QColor("#0c1a2c"))
             p.drawRect(x, int(y_top), 1, int(y_bot - y_top))
 
-        # 2) 亮蓝色尖刺：上半亮蓝、下半暗蓝
-        p.setPen(QPen(QColor("#4fc3f7"), 1))
+        # 2) 尖刺：正在读=亮蓝，未读=暗蓝
         for x in range(W):
             if not has[x]:
                 continue
-            p.drawLine(x, int(mid), x, int(mid - maxs[x] * amp))
-        p.setPen(QPen(QColor("#2b6ba8"), 1))
-        for x in range(W):
-            if not has[x]:
-                continue
-            p.drawLine(x, int(mid), x, int(mid - mins[x] * amp))
+            if hl[x]:
+                p.setPen(QPen(QColor("#4fc3f7"), 1))
+                p.drawLine(x, int(mid), x, int(mid - maxs[x] * amp))
+                p.setPen(QPen(QColor("#2b6ba8"), 1))
+                p.drawLine(x, int(mid), x, int(mid - mins[x] * amp))
+            else:
+                p.setPen(QPen(QColor("#2a5a7e"), 1))
+                p.drawLine(x, int(mid), x, int(mid - maxs[x] * amp))
+                p.setPen(QPen(QColor("#1a3c58"), 1))
+                p.drawLine(x, int(mid), x, int(mid - mins[x] * amp))
 
-        # 3) 橙色平滑包络线
-        p.setPen(QPen(QColor("#ffa726"), 2))
+        # 3) 平滑包络线：正在读=亮橙，未读=暗橙
         prev = None
         for x in range(W):
             if not has[x] or env_cnt[x] == 0:
                 prev = None
                 continue
             y = mid - (env_sum[x] / env_cnt[x]) * amp
+            p.setPen(QPen(QColor("#ffa726") if hl[x] else QColor("#7a5a22"), 2))
             if prev is not None:
                 p.drawLine(prev[0], prev[1], x, int(y))
             prev = (x, int(y))

@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
         # 播放/波形相关状态（由成员3 的 media_processing 驱动）
         self._playback = None
         self._wave_worker = None
+        self._wave_proc = None       # 共享 WaveformProcessor（缓存音频，避免重复解码）
         self._boundaries = None      # SpeechBoundaries，供错误检测用
         self._duration = 0.0
 
@@ -152,31 +154,41 @@ class MainWindow(QMainWindow):
         vp.seekRequested.connect(self._on_seek_frac)
         # 点击波形 → 跳转播放位置
         self.aboboo_view.seekRequested.connect(self._on_seek_seconds)
-        # 选中字幕 → 第 2 分区显示该句的切片波形
-        self.aboboo_view.subtitle_list.selected.connect(self._on_subtitle_selected)
+        # 选中/播放到某句 → 生成该句的高分辨率单句波形（含高亮）
+        self.aboboo_view.sentenceActivated.connect(self._on_sentence_activated)
         self._log("info", "视频预览已就绪")
 
-    def _on_subtitle_selected(self, item):
-        """选中某条字幕 → 切片出该句波形，喂给单句波形区。
+    def _get_wave_proc(self):
+        """懒加载共享的 WaveformProcessor，复用其音频缓存，避免每次点击都重新解码。"""
+        if self._wave_proc is None:
+            try:
+                from media_processing import WaveformProcessor
+                self._wave_proc = WaveformProcessor(use_cache=True)
+            except Exception:
+                self._wave_proc = None
+        return self._wave_proc
 
-        复用成员3 的 ``WaveformProcessor`` 缓存（同一进程内只解码一次），
-        所以连续点击不同句子不会重复解码整段音频。
-        """
-        if not self.video_path or item is None:
+    def _on_sentence_activated(self, item):
+        """某句被选中/播放到 → 生成带前后上下文的高分辨率切片波形并高亮该句。"""
+        if item is None or not self.video_path:
             return
+        start_s = item.start_ms / 1000.0
+        end_s = item.end_ms / 1000.0
+        pad = max(0.3, (end_s - start_s) * 0.3)
+        seg_start = max(0.0, start_s - pad)
+        seg_end = end_s + pad
         try:
             from media_processing import build_segment_track, to_gui_track
             seg = build_segment_track(
-                self.video_path,
-                item.start_ms / 1000.0,
-                item.end_ms / 1000.0,
-                target_points=1000,
-            )
+                self.video_path, seg_start, seg_end, target_points=1000,
+                processor=self._get_wave_proc())
             try:
                 seg = to_gui_track(seg)
             except Exception:
                 pass
-            self.aboboo_view.set_segment_waveform(seg)
+            # 切片从 seg_start 开始，该句在切片内的起点是 start_s - seg_start
+            self.aboboo_view.set_segment_waveform(
+                seg, start_s - seg_start, end_s - seg_start)
         except Exception as e:
             self._log("warning", f"单句波形生成失败：{e}")
 
@@ -322,8 +334,27 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_button_bar())
 
     def _build_import_area(self):
-        box = QGroupBox("文件导入")
-        form = QFormLayout(box)
+        # 可折叠的文件导入区：点击标题栏收起/展开
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        self.import_toggle = QToolButton()
+        self.import_toggle.setText("文件导入")
+        self.import_toggle.setCheckable(True)
+        self.import_toggle.setChecked(True)
+        self.import_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.import_toggle.setArrowType(Qt.ArrowType.DownArrow)
+        self.import_toggle.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; color: #dbe2ee; padding: 4px 8px; }"
+            "QToolButton:hover { color: #ffffff; }")
+        self.import_toggle.toggled.connect(self._toggle_import_area)
+        v.addWidget(self.import_toggle)
+
+        self.import_content = QWidget()
+        form = QFormLayout(self.import_content)
+        form.setContentsMargins(8, 4, 8, 4)
 
         self.video_edit = QLineEdit()
         self.video_edit.setReadOnly(True)
@@ -355,7 +386,13 @@ class MainWindow(QMainWindow):
         row_o.addWidget(self.btn_out)
         form.addRow("输出目录", self._wrap(row_o))
 
-        return box
+        v.addWidget(self.import_content)
+        return container
+
+    def _toggle_import_area(self, checked: bool):
+        self.import_content.setVisible(checked)
+        self.import_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
 
     def _build_task_area(self):
         box = QGroupBox("任务")

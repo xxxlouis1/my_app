@@ -39,6 +39,7 @@ class AbobooView(QWidget):
     """Aboboo 式分区主视图。"""
 
     seekRequested = Signal(float)  # 点击波形请求跳转播放位置（秒），供成员3播放器 seek
+    sentenceActivated = Signal(object)  # 某句被选中/播放到（供主窗口生成高分辨率切片波形）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,16 +94,21 @@ class AbobooView(QWidget):
         self._duration = track.duration if track else 0.0
         self.full_plot.set_track(track)
 
-    def set_segment_waveform(self, track: Optional[WaveformTrack]):
-        """设置单句（第 2 分区）波形。
+    def set_segment_waveform(self, track: Optional[WaveformTrack],
+                             highlight_start: Optional[float] = None,
+                             highlight_end: Optional[float] = None):
+        """设置单句（第 2 分区）波形，并可选地高亮其中的某段（切片内相对秒）。
 
-        原实现只调 ``sentence_plot.set_view()`` 而从未喂数据，
-        所以单句波形区永远是空的。由主窗口在选中字幕时用
-        ``media_processing.build_segment_track`` 切片后调用本方法。
+        切片会带上前后上下文，所以「正在读的那句」在切片里不一定是 0~末尾，
+        由主窗口用 ``highlight_start`` / ``highlight_end`` 显式给出高亮区间。
         """
         self.sentence_plot.set_track(track)
         if track is not None and track.duration > 0:
             self.sentence_plot.set_view(0.0, track.duration)
+        if highlight_start is not None and highlight_end is not None:
+            self.sentence_plot.set_highlight(highlight_start, highlight_end)
+        else:
+            self.sentence_plot.clear_highlight()
 
     def set_subtitles(self, items: List[SubtitleItem]):
         """成员2 产出字幕条目（含错误标注）后调用。"""
@@ -156,15 +162,11 @@ class AbobooView(QWidget):
     def _select_item(self, item: SubtitleItem):
         start_s = item.start_ms / 1000.0
         end_s = item.end_ms / 1000.0
-        pad = max(0.3, (end_s - start_s) * 0.3)
-        # 单句波形：如果主窗口已喂入"该句的切片轨"（0~句长），
-        # 就不要再按绝对时间 set_view，否则会把切片轨的视野算错。
-        # 没有切片轨时退回"在全片波形上缩放到该句"。
-        if getattr(self.sentence_plot, "_track", None) is None:
-            self.sentence_plot.set_view(start_s - pad, end_s + pad)
         self.full_plot.set_selection(start_s, end_s)
         if self._duration > 0:
             self.brace.set_span(start_s / self._duration, end_s / self._duration)
         self.error_panel.set_error(item)
         self.video_panel.set_subtitle(item.text, item.translation)
         self.subtitle_list.select_item(item)
+        # 通知主窗口为该句生成高分辨率单句波形（含前后上下文 + 高亮）
+        self.sentenceActivated.emit(item)
